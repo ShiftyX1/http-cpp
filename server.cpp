@@ -4,111 +4,136 @@
 #include <unistd.h>
 #include <fstream>
 #include <sstream>
+#include <cstring>
+#include <algorithm>
+#include <cctype>
 
 using std::cout;
 using std::cin;
 
-struct HttpResponseStartLine {
-    std::string version;
-    int statusCode;
-    std::string statusMessage;
-};
 
-struct HttpResponse {
-    HttpResponseStartLine startLine;
-    std::string headers;
-    std::string body;
-};
-
-struct HttpRequestStartLine {
-    std::string method;
-    std::string path;
-    std::string version;
-};
-
-struct HttpRequest {
-    HttpRequestStartLine startLine;
-    std::string headers;
-    std::string body;
-};
-
-int getLineCount(const std::istringstream& requestStream) {
-    int lineCount = 0;
-    std::string line;
-    std::istringstream tempStream(requestStream.str());
-    while (std::getline(tempStream, line)) {
-        lineCount++;
-    }
-    return lineCount;
-}
-
-std::string generateHttpResponseFromRequest(const HttpRequest& request) {
-    std::ostringstream responseStream;
-    HttpResponse response;
-
-    response.startLine.version = "HTTP/1.1";
-    response.startLine.statusCode = 200;
-    response.startLine.statusMessage = "OK";
-
-    response.headers = "Content-Type: text/plain\r\nContent-Length: " + std::to_string(request.body.size()) + "\r\n";
-    response.body = "Echo: " + request.body;
-
-    responseStream << response.startLine.version << " " << response.startLine.statusCode << " " << response.startLine.statusMessage << "\r\n";
-    responseStream << response.headers << "\r\n";
-    responseStream << response.body;
-
-    return responseStream.str();
-}
-
-void parseHttpRequest(const std::string& request) {
-    std::istringstream requestStream(request);
-    std::string line;
-    int lineCount = getLineCount(requestStream);
-    cout << "Total Lines in Request: " << lineCount << "\n";
-    bool firstLine = true;
-    while (std::getline(requestStream, line) && line != "\r") {
-        if (firstLine) {
-            std::istringstream lineStream(line);
-            HttpRequestStartLine startLine;
-            lineStream >> startLine.method >> startLine.path >> startLine.version;
-            cout << "Method: " << startLine.method << ", Path: " << startLine.path << ", Version: " << startLine.version << "\n";
-            firstLine = false;
-            continue;
-        }
-        cout << "Header Line: " << line << "\n";
-    }
-}
-
-int startServer(int port) {
+int startServer(int port, int backlog) {
     int serverSocket = socket(AF_INET, SOCK_STREAM, 0);
+    if (serverSocket < 0) {
+        perror("socket");
+        return 1;
+    }
+
+    int opt = 1;
+    if (setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        perror("setsockopt");
+        close(serverSocket);
+        return 1;
+    }
+
     sockaddr_in serverAddress;
+    std::memset(&serverAddress, 0, sizeof(serverAddress));
     serverAddress.sin_family = AF_INET;
     serverAddress.sin_port = htons(port);
     serverAddress.sin_addr.s_addr = INADDR_ANY;
 
-    bind(serverSocket, (struct sockaddr*)&serverAddress, sizeof(serverAddress));
-    listen(serverSocket, 5);
+    if (bind(serverSocket, (struct sockaddr*)&serverAddress, sizeof(serverAddress)) < 0) {
+        perror("bind");
+        close(serverSocket);
+        return 1;
+    }
 
-    cout << "Server is listening on port " << ntohs(serverAddress.sin_port) << "...\n";
+    if (listen(serverSocket, backlog) < 0) {
+        perror("listen");
+        close(serverSocket);
+        return 1;
+    }
+
+    cout << "Server is listening on port " << port << "...\n";
 
     while (true) {
         int clientSocket = accept(serverSocket, nullptr, nullptr);
-        char buffer[1024] {0};
-        recv(clientSocket, buffer, sizeof(buffer), 0);
-
-        HttpRequest request;
-        request.body = buffer;
-
-        std::string response = generateHttpResponseFromRequest(request);
-
-        ssize_t bytesSent = send(clientSocket, response.c_str(), response.size(), 0);
-        if (bytesSent < 0) {
-            perror("Failed to send response to client.\n");
-        } else {
-            cout << "Sent " << bytesSent << " bytes back to client.\n";
+        if (clientSocket < 0) {
+            perror("accept");
+            continue;
         }
 
-        buffer[0] = '\0';
+        std::string request;
+        char buf[4096];
+        ssize_t n;
+        size_t headerEnd = std::string::npos;
+        int contentLength = 0;
+
+        while ((n = recv(clientSocket, buf, sizeof(buf), 0)) > 0) {
+            request.append(buf, (size_t)n);
+            if (headerEnd == std::string::npos) {
+                headerEnd = request.find("\r\n\r\n");
+                if (headerEnd != std::string::npos) {
+                    std::string headers = request.substr(0, headerEnd);
+                    std::string lower = headers;
+                    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+                    size_t pos = lower.find("content-length:");
+                    if (pos != std::string::npos) {
+                        pos += strlen("content-length:");
+                        while (pos < lower.size() && isspace((unsigned char)lower[pos])) ++pos;
+                        size_t endpos = pos;
+                        while (endpos < lower.size() && isdigit((unsigned char)lower[endpos])) ++endpos;
+                        if (endpos > pos) {
+                            contentLength = std::stoi(lower.substr(pos, endpos - pos));
+                        }
+                    }
+                }
+            }
+            if (headerEnd != std::string::npos) {
+                size_t totalNeeded = headerEnd + 4 + (size_t)contentLength;
+                if (request.size() >= totalNeeded) break;
+            }
+        }
+
+        if (n < 0) {
+            perror("recv");
+            close(clientSocket);
+            continue;
+        }
+
+        size_t firstLineEnd = request.find("\r\n");
+        if (firstLineEnd == std::string::npos) {
+            firstLineEnd = request.find("\n");
+        }
+        std::string requestLine = request.substr(0, firstLineEnd);
+        
+        std::istringstream iss(requestLine);
+        std::string method, path, version;
+        iss >> method >> path >> version;
+        
+        cout << "Request: " << method << " " << path << " " << version << "\n";
+
+        std::string body;
+        if (headerEnd != std::string::npos) {
+            size_t bodyStart = headerEnd + 4;
+            if (bodyStart < request.size()) {
+                body = request.substr(bodyStart, contentLength);
+            }
+        }
+
+        std::string responseBody = "Echo: " + body;
+        std::ostringstream resp;
+        resp << "HTTP/1.1 200 OK\r\n";
+        resp << "Content-Type: text/plain\r\n";
+        resp << "Content-Length: " << responseBody.size() << "\r\n";
+        resp << "Connection: close\r\n";
+        resp << "\r\n";
+        resp << responseBody;
+        std::string response = resp.str();
+
+        ssize_t totalSent = 0;
+        ssize_t toSend = (ssize_t)response.size();
+        const char* sendPtr = response.c_str();
+        while (totalSent < toSend) {
+            ssize_t sent = send(clientSocket, sendPtr + totalSent, toSend - totalSent, 0);
+            if (sent < 0) {
+                perror("send");
+                break;
+            }
+            totalSent += sent;
+        }
+        cout << "Sent " << totalSent << " bytes back to client.\n";
+
         close(clientSocket);
     }
     close(serverSocket);
@@ -117,9 +142,15 @@ int startServer(int port) {
 
 int main(int argc, char* argv[]) {
     int port = 8080;
+    int backlog = 5;
+
     if (argc > 1) {
         port = std::stoi(argv[1]);
+        if (argc > 2) {
+            backlog = std::stoi(argv[2]);
+        }
     }
-    return startServer(port);
+
+    return startServer(port, backlog);
 }
 
