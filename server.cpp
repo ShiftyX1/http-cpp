@@ -44,7 +44,7 @@ int startServer(int port, int backlog) {
         return 1;
     }
 
-    cout << "Server is listening on port " << port << "...\n";
+    cout << "Server is listening on port " << port << "...\n" << std::flush;
 
     while (true) {
         int clientSocket = accept(serverSocket, nullptr, nullptr);
@@ -101,7 +101,7 @@ int startServer(int port, int backlog) {
         std::string method, path, version;
         iss >> method >> path >> version;
         
-        cout << "Request: " << method << " " << path << " " << version << "\n";
+        cout << "Request: " << method << " " << path << " " << version << "\n" << std::flush;
 
         std::string body;
         if (headerEnd != std::string::npos) {
@@ -132,7 +132,7 @@ int startServer(int port, int backlog) {
             }
             totalSent += sent;
         }
-        cout << "Sent " << totalSent << " bytes back to client.\n";
+        cout << "Sent " << totalSent << " bytes back to client.\n" << std::flush;
 
         close(clientSocket);
     }
